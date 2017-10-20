@@ -13,12 +13,28 @@
  * limitations under the License.
  */
 
-#include "jerryscript.h"
-#include "jerryscript-ext/module.h"
+var o = {
+  x: 13,
 
-#define MODULE_NAME my_broken_module
+  f: function()
+  {
+    return () => this.x + 1
+  },
 
-/*
- * A broken module to test that the loader complains about the absence of on_resolve ()
- */
-JERRYX_NATIVE_MODULE (MODULE_NAME, NULL)
+  g: function()
+  {
+    return function() {
+      return this.x + 1
+    }
+  }
+}
+
+assert(o.f().call(o) === 14);
+assert(o.g().call(o) === 14);
+
+assert(o.f()() === 14);
+
+var o2 = { x:4, f:o.f(), g:o.g() }
+
+assert(o2.f() === 14);
+assert(o2.g() === 5);

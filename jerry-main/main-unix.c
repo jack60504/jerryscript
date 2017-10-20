@@ -268,6 +268,38 @@ register_js_function (const char *name_p, /**< name of the function */
   jerry_release_value (result_val);
 } /* register_js_function */
 
+#ifdef JERRY_DEBUGGER
+
+/**
+ * Runs the source code received by jerry_debugger_wait_for_client_source.
+ *
+ * @return result fo the source code execution
+ */
+static jerry_value_t
+wait_for_source_callback (const jerry_char_t *resource_name_p, /**< resource name */
+                          size_t resource_name_size, /**< size of resource name */
+                          const jerry_char_t *source_p, /**< source code */
+                          size_t source_size, /**< source code size */
+                          void *user_p __attribute__((unused))) /**< user pointer */
+{
+  jerry_value_t ret_val = jerry_parse_named_resource (resource_name_p,
+                                                      resource_name_size,
+                                                      source_p,
+                                                      source_size,
+                                                      false);
+
+  if (!jerry_value_has_error_flag (ret_val))
+  {
+    jerry_value_t func_val = ret_val;
+    ret_val = jerry_run (func_val);
+    jerry_release_value (func_val);
+  }
+
+  return ret_val;
+} /* wait_for_source_callback */
+
+#endif /* JERRY_DEBUGGER */
+
 /**
  * Command line option IDs
  */
@@ -287,6 +319,7 @@ typedef enum
   OPT_SAVE_LIT_LIST,
   OPT_SAVE_LIT_C,
   OPT_EXEC_SNAP,
+  OPT_EXEC_SNAP_FUNC,
   OPT_LOG_LEVEL,
   OPT_ABORT_ON_FAIL,
   OPT_NO_PROMPT
@@ -325,6 +358,8 @@ static const cli_opt_t main_opts[] =
                .help = "export literals found in parsed JS input (in C source format)"),
   CLI_OPT_DEF (.id = OPT_EXEC_SNAP, .longopt = "exec-snapshot", .meta = "FILE",
                .help = "execute input snapshot file(s)"),
+  CLI_OPT_DEF (.id = OPT_EXEC_SNAP_FUNC, .longopt = "exec-snapshot-func", .meta = "FILE NUM",
+               .help = "execute specific function from input snapshot file(s)"),
   CLI_OPT_DEF (.id = OPT_LOG_LEVEL, .longopt = "log-level", .meta = "NUM",
                .help = "set log level (0-3)"),
   CLI_OPT_DEF (.id = OPT_ABORT_ON_FAIL, .longopt = "abort-on-fail",
@@ -395,6 +430,7 @@ main (int argc,
   jerry_init_flag_t flags = JERRY_INIT_EMPTY;
 
   const char *exec_snapshot_file_names[argc];
+  uint32_t exec_snapshot_file_indices[argc];
   int exec_snapshots_count = 0;
 
   bool is_parse_only = false;
@@ -420,7 +456,7 @@ main (int argc,
     {
       case OPT_HELP:
       {
-        cli_help (argv[0], main_opts);
+        cli_help (argv[0], NULL, main_opts);
         return JERRY_STANDALONE_EXIT_CODE_OK;
       }
       case OPT_VERSION:
@@ -512,7 +548,21 @@ main (int argc,
       {
         if (check_feature (JERRY_FEATURE_SNAPSHOT_EXEC, cli_state.arg))
         {
-          exec_snapshot_file_names[exec_snapshots_count++] = cli_consume_string (&cli_state);
+          exec_snapshot_file_names[exec_snapshots_count] = cli_consume_string (&cli_state);
+          exec_snapshot_file_indices[exec_snapshots_count++] = 0;
+        }
+        else
+        {
+          cli_consume_string (&cli_state);
+        }
+        break;
+      }
+      case OPT_EXEC_SNAP_FUNC:
+      {
+        if (check_feature (JERRY_FEATURE_SNAPSHOT_EXEC, cli_state.arg))
+        {
+          exec_snapshot_file_names[exec_snapshots_count] = cli_consume_string (&cli_state);
+          exec_snapshot_file_indices[exec_snapshots_count++] = (uint32_t) cli_consume_int (&cli_state);
         }
         else
         {
@@ -618,9 +668,10 @@ main (int argc,
       }
       else
       {
-        ret_value = jerry_exec_snapshot (snapshot_p,
-                                         snapshot_size,
-                                         true);
+        ret_value = jerry_exec_snapshot_at (snapshot_p,
+                                            snapshot_size,
+                                            exec_snapshot_file_indices[i],
+                                            true);
       }
 
       if (jerry_value_has_error_flag (ret_value))
@@ -723,27 +774,50 @@ main (int argc,
   {
     is_repl_mode = false;
 #ifdef JERRY_DEBUGGER
-    jerry_value_t run_result;
-    jerry_debugger_wait_and_run_type_t receive_status;
 
-    do
+    while (true)
     {
-      receive_status = jerry_debugger_wait_and_run_client_source (&run_result);
+      jerry_debugger_wait_for_source_status_t receive_status;
 
-      if (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVE_FAILED)
+      do
       {
-        ret_value = jerry_create_error (JERRY_ERROR_COMMON,
-                                        (jerry_char_t *) "Connection aborted before source arrived.");
+        jerry_value_t run_result;
+
+        receive_status = jerry_debugger_wait_for_client_source (wait_for_source_callback,
+                                                                NULL,
+                                                                &run_result);
+
+        if (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVE_FAILED)
+        {
+          ret_value = jerry_create_error (JERRY_ERROR_COMMON,
+                                          (jerry_char_t *) "Connection aborted before source arrived.");
+        }
+
+        if (receive_status == JERRY_DEBUGGER_SOURCE_END)
+        {
+          jerry_port_log (JERRY_LOG_LEVEL_DEBUG, "No more client source.\n");
+        }
+
+        jerry_release_value (run_result);
+      }
+      while (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVED);
+
+      if (receive_status != JERRY_DEBUGGER_CONTEXT_RESET_RECEIVED)
+      {
+        break;
       }
 
-      if (receive_status == JERRY_DEBUGGER_SOURCE_END)
-      {
-        jerry_port_log (JERRY_LOG_LEVEL_DEBUG, "No more client source.\n");
-      }
+      jerry_cleanup ();
 
-      jerry_release_value (run_result);
+      jerry_init (flags);
+      jerry_debugger_init (debug_port);
+
+      register_js_function ("assert", jerryx_handler_assert);
+      register_js_function ("gc", jerryx_handler_gc);
+      register_js_function ("print", jerryx_handler_print);
+
+      ret_value = jerry_create_undefined ();
     }
-    while (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVED);
 
 #endif /* JERRY_DEBUGGER */
   }
